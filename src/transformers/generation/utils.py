@@ -107,6 +107,7 @@ from .stopping_criteria import (
     StoppingCriteriaList,
     StopStringCriteria,
 )
+from ..utils.entropy import _select_layers_from_entropies, calculate_information_entropy
 
 
 if TYPE_CHECKING:
@@ -136,6 +137,7 @@ GENERATION_MODES_MAPPING = {
     GenerationMode.BEAM_SEARCH: "_beam_search",
     GenerationMode.BEAM_SAMPLE: "_beam_search",
     GenerationMode.ASSISTED_GENERATION: "_assisted_decoding",
+    GenerationMode.ENTROPY_DECODING: "_entropy_decoding",
     # Deprecated methods
     GenerationMode.DOLA_GENERATION: "transformers-community/dola",
     GenerationMode.CONTRASTIVE_SEARCH: "transformers-community/contrastive-search",
@@ -170,6 +172,32 @@ class GenerateDecoderOnlyOutput(ModelOutput):
         past_key_values (`Cache`, *optional*, returned when `use_cache=True`):
             Returns the model cache, used to speed up decoding. Different models have a different cache format, check
             the model's documentation. Usually, a [`~cache_utils.Cache`] instance.
+        entropy_selected_layer_indices (`tuple(torch.LongTensor)`, *optional*, returned when `entropy_decoding` is enabled):
+            The layer index (per sample, per generation step) selected by the entropy valley strategy.
+            Shape: one `[B]` tensor per generated token.
+        entropy_per_layer_entropies (`tuple(torch.FloatTensor)`, *optional*, returned when `entropy_decoding` is enabled and `entropy_record_per_layer_metrics=True`):
+            Per-step normalized information entropies for every transformer layer.
+            Shape: one `[B, num_layers]` tensor per generated token.
+        entropy_per_layer_logits (`tuple(torch.FloatTensor)`, *optional*, returned when `entropy_decoding` is enabled and `entropy_record_per_layer_metrics=True` and `entropy_logits_top_k` is None):
+            Per-step raw logits (before logits_processor) for every transformer layer.
+            Shape: one `[B, num_layers, vocab_size]` tensor per generated token.
+            WARNING: This can be very memory-intensive for large vocabularies. Set
+            `entropy_logits_top_k` to a positive integer to record only the top-k logits instead.
+        entropy_per_layer_top_k_logits (`tuple(torch.FloatTensor)`, *optional*, returned when `entropy_decoding` is enabled and `entropy_record_per_layer_metrics=True` and `entropy_logits_top_k` is set):
+            Per-step top-k raw logits for every transformer layer.
+            Shape: one `[B, num_layers, top_k]` tensor per generated token.
+        entropy_per_layer_top_k_indices (`tuple(torch.LongTensor)`, *optional*, returned when `entropy_decoding` is enabled and `entropy_record_per_layer_metrics=True` and `entropy_logits_top_k` is set):
+            Token indices corresponding to `entropy_per_layer_top_k_logits`.
+            Shape: one `[B, num_layers, top_k]` tensor per generated token.
+        entropy_per_layer_hidden_states (`tuple(torch.FloatTensor)`, *optional*, returned when `entropy_decoding` is enabled and `entropy_record_per_layer_hidden_states=True`):
+            Per-step hidden states (last position only) for every transformer layer.
+            Shape: one `[B, num_layers, hidden_size]` tensor per generated token.
+        entropy_per_layer_token_ids (`tuple(torch.LongTensor)`, *optional*, returned when `entropy_decoding` is enabled and `entropy_record_tokens=True`):
+            Per-step argmax token ids from every layer's logits (after logits_processor).
+            Shape: one `[B, num_layers]` tensor per generated token.
+        entropy_selected_token_ids (`tuple(torch.LongTensor)`, *optional*, returned when `entropy_decoding` is enabled and `entropy_record_tokens=True`):
+            The actual decoded token ids selected from the entropy-valley layer (after sampling/greedy).
+            Shape: one `[B]` tensor per generated token.
     """
 
     sequences: torch.LongTensor
@@ -178,6 +206,35 @@ class GenerateDecoderOnlyOutput(ModelOutput):
     attentions: tuple[tuple[torch.FloatTensor]] | None = None
     hidden_states: tuple[tuple[torch.FloatTensor]] | None = None
     past_key_values: Cache | None = None
+    # Entropy-based inner-layer decoding observation fields
+    # Layer indices selected by the entropy valley strategy at each generation step.
+    # Always recorded when entropy_decoding is used and return_dict_in_generate=True.
+    # Shape: tuple of [B] tensors, one per generated step.
+    entropy_selected_layer_indices: tuple[torch.LongTensor] | None = None
+    # Per-step per-layer normalized information entropies (after logits_processor, before sampling).
+    # Recorded only when entropy_record_per_layer_metrics=True.
+    # Shape: tuple of [B, num_layers] tensors, one per generated step.
+    entropy_per_layer_entropies: tuple[torch.FloatTensor] | None = None
+    # Per-step per-layer raw logits (before logits_processor).
+    # Recorded only when entropy_record_per_layer_metrics=True.
+    # Shape: tuple of [B, num_layers, vocab_size] tensors, one per generated step.
+    entropy_per_layer_logits: tuple[torch.FloatTensor] | None = None
+    # Top-k logits per layer per step — recorded only when entropy_record_per_layer_metrics=True
+    # and entropy_logits_top_k is set to a positive integer.
+    # Shape: tuple of [B, num_layers, top_k] tensors, one per generated step.
+    entropy_per_layer_top_k_logits: tuple[torch.FloatTensor] | None = None
+    # Top-k token indices corresponding to entropy_per_layer_top_k_logits.
+    # Shape: tuple of [B, num_layers, top_k] tensors, one per generated step.
+    entropy_per_layer_top_k_indices: tuple[torch.LongTensor] | None = None
+    # Per-step per-layer hidden states (last position only, after each transformer layer).
+    # Recorded only when entropy_record_per_layer_hidden_states=True.
+    # Shape: tuple of [B, num_layers, hidden_size] tensors, one per generated step.
+    entropy_per_layer_hidden_states: tuple[torch.FloatTensor] | None = None
+    # Per-step per-layer argmax token ids (from each layer's logits).
+    # Also the final decoded token ids selected from the entropy valley layer.
+    # Both recorded only when entropy_record_tokens=True.
+    entropy_per_layer_token_ids: tuple[torch.LongTensor] | None = None
+    entropy_selected_token_ids: tuple[torch.LongTensor] | None = None
 
 
 @dataclass
@@ -2837,6 +2894,328 @@ class GenerationMixin(ContinuousMixin):
                     hidden_states=decoder_hidden_states,
                     past_key_values=cache,
                 )
+        else:
+            return input_ids
+
+    def _entropy_decoding(
+        self: "GenerativePreTrainedModel",
+        input_ids: torch.LongTensor,
+        logits_processor: LogitsProcessorList,
+        stopping_criteria: StoppingCriteriaList,
+        generation_config: GenerationConfig,
+        synced_gpus: bool = False,
+        streamer: Optional["BaseStreamer"] = None,
+        **model_kwargs,
+    ) -> GenerateNonBeamOutput | torch.LongTensor:
+        r"""
+        Generates sequences using an entropy valley (minimum entropy layer) decoding strategy.
+
+        At each generation step, the model computes softmax entropy for every transformer layer's
+        output logits and selects the layer with the lowest normalized entropy (the "entropy valley")
+        as the source of the next token logits. This contrasts with standard decoding, which always
+        uses the last transformer layer.
+
+        Two strategies are supported via `generation_config.entropy_decoding`:
+        - `"trough"`: Always decode from the entropy-valley layer.
+        - `"random_after"`: Randomly select a layer from the valley to the last layer (uniform).
+        - `None`: Observation-only mode — uses the last layer for decoding but records all
+          per-layer statistics (useful for comparing entropy-valley selection against standard decoding
+          without changing the output).
+
+        Memory safety:
+        - By default (`entropy_logits_top_k=None`), full vocab-size logits are recorded when
+          `entropy_record_per_layer_metrics=True`, which can be very memory-intensive.
+          Set `entropy_logits_top_k` to a positive integer to record only the top-k logits/indices
+          per layer per step instead.
+        - When `entropy_offload_to_cpu=True` (default when any entropy record flag is set), all
+          observation tensors are moved to CPU immediately after computation to keep GPU memory bounded.
+
+        Parameters:
+            input_ids (`torch.LongTensor`):
+                The sequence used as a prompt for the generation.
+            logits_processor, stopping_criteria, generation_config, synced_gpus, streamer, model_kwargs:
+                Same as `_sample`.
+
+        Return:
+            [`~generation.GenerateDecoderOnlyOutput`] or `torch.LongTensor`: Same as `_sample`, with the
+            addition of entropy-observation tensors when `return_dict_in_generate=True`.
+        """
+        if self.config.is_encoder_decoder:
+            raise ValueError(
+                "Entropy-based inner-layer decoding is only available for decoder-only models."
+            )
+        # Support both self.lm_head (common) and self.get_output_embeddings() (generic interface)
+        lm_head = getattr(self, "lm_head", None)
+        if lm_head is None:
+            lm_head = self.get_output_embeddings()
+        if lm_head is None:
+            raise ValueError(
+                "Entropy-based inner-layer decoding requires a CausalLM model with an `lm_head` "
+                "or a `get_output_embeddings()` module."
+            )
+
+        entropy_strategy = generation_config.entropy_decoding
+        record_tokens = generation_config.entropy_record_tokens
+        record_per_layer_metrics = generation_config.entropy_record_per_layer_metrics
+        record_per_layer_hidden_states = generation_config.entropy_record_per_layer_hidden_states
+        logits_top_k = generation_config.entropy_logits_top_k
+        offload_to_cpu = generation_config.entropy_offload_to_cpu
+
+        # If no explicit offload flag is set, default to CPU offload for memory safety whenever
+        # any observation flag is active.
+        any_record_flag = (
+            record_tokens or record_per_layer_metrics or record_per_layer_hidden_states
+        )
+        if offload_to_cpu is None and any_record_flag:
+            offload_to_cpu = True
+        elif offload_to_cpu is None:
+            offload_to_cpu = False
+
+        pad_token_id = generation_config._pad_token_tensor
+        output_attentions = generation_config.output_attentions
+        output_scores = generation_config.output_scores
+        output_logits = generation_config.output_logits
+        return_dict_in_generate = generation_config.return_dict_in_generate
+        has_eos_stopping_criteria = any(hasattr(criteria, "eos_token_id") for criteria in stopping_criteria)
+        do_sample = generation_config.do_sample
+
+        # init output tuples
+        scores = () if (return_dict_in_generate and output_scores) else None
+        raw_logits = () if (return_dict_in_generate and output_logits) else None
+        decoder_attentions = () if (return_dict_in_generate and output_attentions) else None
+        output_hidden_states = generation_config.output_hidden_states
+        decoder_hidden_states = () if (return_dict_in_generate and output_hidden_states) else None
+
+        # Entropy observation tuples — initialised only when return_dict_in_generate is True
+        entropy_selected_layer_indices: tuple[torch.Tensor, ...] | None = (
+            () if return_dict_in_generate else None
+        )
+        entropy_per_layer_entropies: tuple[torch.Tensor, ...] | None = (
+            () if (return_dict_in_generate and record_per_layer_metrics) else None
+        )
+        # Full vocab logits: only recorded when record_per_layer_metrics=True and logits_top_k is None
+        entropy_per_layer_logits: tuple[torch.Tensor, ...] | None = (
+            () if (return_dict_in_generate and record_per_layer_metrics and logits_top_k is None) else None
+        )
+        # Top-k variants: recorded when record_per_layer_metrics=True and logits_top_k > 0
+        entropy_per_layer_top_k_logits: tuple[torch.Tensor, ...] | None = (
+            () if (return_dict_in_generate and record_per_layer_metrics and logits_top_k is not None and logits_top_k > 0) else None
+        )
+        entropy_per_layer_top_k_indices: tuple[torch.Tensor, ...] | None = (
+            () if (return_dict_in_generate and record_per_layer_metrics and logits_top_k is not None and logits_top_k > 0) else None
+        )
+        entropy_per_layer_hidden_states: tuple[torch.Tensor, ...] | None = (
+            () if (return_dict_in_generate and record_per_layer_hidden_states) else None
+        )
+        entropy_per_layer_token_ids: tuple[torch.Tensor, ...] | None = (
+            () if (return_dict_in_generate and record_tokens) else None
+        )
+        entropy_selected_token_ids: tuple[torch.Tensor, ...] | None = (
+            () if (return_dict_in_generate and record_tokens) else None
+        )
+
+        batch_size = input_ids.shape[0]
+        this_peer_finished = False
+        unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
+
+        model_forward = (
+            self.get_compiled_call(generation_config.compile_config)
+            if self._valid_auto_compile_criteria(model_kwargs, generation_config)
+            else self.__call__
+        )
+
+        # Entropy-based decoding requires all-layer hidden states; force it internally.
+        model_kwargs["output_hidden_states"] = True
+
+        prefill_consumed = False
+        outputs = self._prefill(
+            input_ids,
+            generation_config,
+            model_kwargs,
+            is_first_iteration=True,
+        )
+
+        def _record(tensor: torch.Tensor) -> torch.Tensor:
+            """Move tensor to CPU non-blocking if offload_to_cpu is enabled."""
+            if offload_to_cpu and tensor is not None:
+                return tensor.to(device="cpu", non_blocking=True)
+            return tensor
+
+        while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
+            if prefill_consumed:
+                next_sequence_length = 1 if model_kwargs["use_cache"] else None
+                model_inputs = self.prepare_inputs_for_generation(
+                    input_ids, next_sequence_length=next_sequence_length, **model_kwargs
+                )
+                with self._optimize_model_for_decode():
+                    outputs = model_forward(**model_inputs, return_dict=True)
+            prefill_consumed = True
+
+            model_kwargs = self._update_model_kwargs_for_generation(
+                outputs,
+                model_kwargs,
+                is_encoder_decoder=self.config.is_encoder_decoder,
+            )
+            if synced_gpus and this_peer_finished:
+                continue
+
+            # Extract all-layer hidden states (last position only)
+            normalized_hidden_states = getattr(outputs, "normalized_hidden_states", None)
+            all_layer_hidden_states = (
+                normalized_hidden_states if normalized_hidden_states is not None else outputs.hidden_states
+            )
+            if all_layer_hidden_states is None:
+                raise ValueError(
+                    "Entropy-based decoding requires `output_hidden_states=True`, but the model did not return them. "
+                    "Please ensure the model returns hidden states from its forward pass."
+                )
+            # all_layer_hidden_states: tuple(len = num_layers + 1), each [B, seq_len, H]
+            # Skip embedding output; keep only per-layer outputs
+            per_layer_step_hiddens: list[torch.Tensor] = [
+                hs[:, -1, :] for hs in all_layer_hidden_states[1:]
+            ]  # L * [B, H]
+
+            # Compute raw logits for each layer
+            logits_per_layer: list[torch.Tensor] = [
+                lm_head(hs) for hs in per_layer_step_hiddens
+            ]  # L * [B, V]
+            L = len(logits_per_layer)
+            device = input_ids.device
+
+            # Apply logits_processor to each layer's raw logits, then compute entropy
+            scores_per_layer: list[torch.Tensor] = []
+            entropies_per_layer: list[torch.Tensor] = []
+            for layer_logits in logits_per_layer:
+                processed_scores = logits_processor(
+                    input_ids, layer_logits.to(dtype=torch.float32, device=device)
+                )
+                scores_per_layer.append(processed_scores)
+                entropy = calculate_information_entropy(processed_scores)
+                entropies_per_layer.append(entropy)
+
+            # Find the entropy valley (trough) layer per sample
+            selected_idx_trough = _select_layers_from_entropies(entropies_per_layer)  # [B]
+
+            # Apply strategy to get final layer index for decoding
+            if entropy_strategy == "trough":
+                final_idx = selected_idx_trough
+            elif entropy_strategy == "random_after":
+                counts = (L - selected_idx_trough).clamp(min=1)
+                rand = torch.rand_like(selected_idx_trough, dtype=torch.float32, device=device)
+                offsets = torch.floor(rand * counts.float()).to(torch.long)
+                final_idx = selected_idx_trough + offsets
+            else:
+                # Observation-only mode: decode from the last layer
+                final_idx = torch.full_like(selected_idx_trough, L - 1, device=device)
+
+            # Extract the final-layer processed scores for token selection
+            scores_stack = torch.stack(scores_per_layer, dim=1)  # [B, L, V]
+            batch_indices = torch.arange(scores_stack.size(0), device=device)
+            next_token_scores = scores_stack[batch_indices, final_idx, :]  # [B, V]
+
+            # Record entropy-selected layer indices (trough, not final — always when return_dict_in_generate)
+            if return_dict_in_generate:
+                entropy_selected_layer_indices = entropy_selected_layer_indices + (  # type: ignore[union-attr]
+                    _record(selected_idx_trough),
+                )
+
+            # Record per-layer entropies and logits (with memory safeguards)
+            if return_dict_in_generate and record_per_layer_metrics:
+                entropy_stack = torch.stack(entropies_per_layer, dim=1)  # [B, L]
+                entropy_per_layer_entropies = entropy_per_layer_entropies + (_record(entropy_stack),)  # type: ignore[union-attr]
+
+                if logits_top_k is None:
+                    # Full vocab logits — use top-k as a safety valve in case vocab is huge
+                    logits_stack = torch.stack(logits_per_layer, dim=1)  # [B, L, V]
+                    entropy_per_layer_logits = entropy_per_layer_logits + (_record(logits_stack),)  # type: ignore[union-attr]
+                elif logits_top_k > 0:
+                    # Top-k logits + indices per layer per step
+                    top_k_logits_list: list[torch.Tensor] = []
+                    top_k_indices_list: list[torch.Tensor] = []
+                    for layer_logits in logits_per_layer:
+                        top_k_logits, top_k_ids = torch.topk(layer_logits, k=logits_top_k, dim=-1)  # [B, top_k]
+                        top_k_logits_list.append(top_k_logits)
+                        top_k_indices_list.append(top_k_ids)
+                    top_k_logits_stack = torch.stack(top_k_logits_list, dim=1)  # [B, L, top_k]
+                    top_k_indices_stack = torch.stack(top_k_indices_list, dim=1)  # [B, L, top_k]
+                    entropy_per_layer_top_k_logits = entropy_per_layer_top_k_logits + (_record(top_k_logits_stack),)  # type: ignore[union-attr]
+                    entropy_per_layer_top_k_indices = entropy_per_layer_top_k_indices + (_record(top_k_indices_stack),)  # type: ignore[union-attr]
+
+            # Record per-layer hidden states
+            if return_dict_in_generate and record_per_layer_hidden_states:
+                hidden_stack = torch.stack(per_layer_step_hiddens, dim=1)  # [B, L, H]
+                entropy_per_layer_hidden_states = entropy_per_layer_hidden_states + (_record(hidden_stack),)  # type: ignore[union-attr]
+
+            # Record per-layer argmax token ids
+            if return_dict_in_generate and record_tokens:
+                token_ids_per_layer = torch.stack(
+                    [layer_scores.argmax(dim=-1) for layer_scores in scores_per_layer], dim=1
+                )  # [B, L]
+                entropy_per_layer_token_ids = entropy_per_layer_token_ids + (_record(token_ids_per_layer),)  # type: ignore[union-attr]
+
+            # Store standard output tensors
+            if return_dict_in_generate:
+                if output_scores:
+                    scores += (next_token_scores,)
+                if output_logits:
+                    logits_stack = torch.stack(logits_per_layer, dim=1)  # [B, L, V]
+                    next_token_logits = logits_stack[batch_indices, final_idx, :]  # [B, V]
+                    raw_logits += (next_token_logits,)
+                if output_attentions:
+                    decoder_attentions += (outputs.attentions,)
+                if output_hidden_states:
+                    decoder_hidden_states += (outputs.hidden_states,)  # type: ignore[union-attr]
+
+            # Token selection
+            if do_sample:
+                probs = nn.functional.softmax(next_token_scores, dim=-1)
+                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+            else:
+                next_tokens = torch.argmax(next_token_scores, dim=-1)
+
+            # Record selected token ids
+            if return_dict_in_generate and record_tokens:
+                entropy_selected_token_ids = entropy_selected_token_ids + (_record(next_tokens),)  # type: ignore[union-attr]
+
+            # Handle EOS
+            if has_eos_stopping_criteria:
+                next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
+
+            # Update input_ids
+            input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+            if streamer is not None:
+                streamer.put(next_tokens.cpu())
+
+            unfinished_sequences = unfinished_sequences & ~stopping_criteria(input_ids, scores)
+            this_peer_finished = unfinished_sequences.max() == 0
+
+            # Release outputs reference to free memory
+            del outputs
+
+        if streamer is not None:
+            streamer.end()
+
+        if return_dict_in_generate:
+            cache = None
+            if any(cache_key in model_kwargs for cache_key in ALL_CACHE_NAMES):
+                cache_key = next(cache_key for cache_key in ALL_CACHE_NAMES if cache_key in model_kwargs)
+                cache = model_kwargs[cache_key]
+            return GenerateDecoderOnlyOutput(
+                sequences=input_ids,
+                scores=scores,
+                logits=raw_logits,
+                attentions=decoder_attentions,
+                hidden_states=decoder_hidden_states,
+                past_key_values=cache,
+                entropy_selected_layer_indices=entropy_selected_layer_indices,
+                entropy_per_layer_entropies=entropy_per_layer_entropies,
+                entropy_per_layer_logits=entropy_per_layer_logits,
+                entropy_per_layer_top_k_logits=entropy_per_layer_top_k_logits,
+                entropy_per_layer_top_k_indices=entropy_per_layer_top_k_indices,
+                entropy_per_layer_hidden_states=entropy_per_layer_hidden_states,
+                entropy_per_layer_token_ids=entropy_per_layer_token_ids,
+                entropy_selected_token_ids=entropy_selected_token_ids,
+            )
         else:
             return input_ids
 

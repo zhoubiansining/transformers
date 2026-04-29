@@ -73,6 +73,7 @@ class GenerationMode(ExplicitEnum):
     SAMPLE = "sample"
     ASSISTED_GENERATION = "assisted_generation"
     DOLA_GENERATION = "dola_generation"
+    ENTROPY_DECODING = "entropy_decoding"
     # Beam methods
     BEAM_SEARCH = "beam_search"
     BEAM_SAMPLE = "beam_sample"
@@ -442,6 +443,39 @@ class GenerationConfig(PushToHubMixin):
 
         self.prefill_chunk_size = kwargs.pop("prefill_chunk_size", None)
 
+        # Entropy-based inner-layer decoding (experimental).
+        # When `entropy_decoding` is set to one of {"trough", "random_after"}, generation will
+        # select an intermediate transformer layer's logits (instead of the last layer's logits)
+        # to sample / argmax the next token from. This requires `output_hidden_states=True` to
+        # be enabled internally, and is currently only supported for decoder-only CausalLM models
+        # exposing an `lm_head` (or `get_output_embeddings()`) module.
+        # If `entropy_decoding` is None but any of the `entropy_record_*` flags is set, generation
+        # still routes through the entropy path but uses the last layer for actual decoding —
+        # i.e., observation-only mode (output is identical to standard greedy/sample, but the
+        # full per-layer statistics are recorded for analysis).
+        self.entropy_decoding = kwargs.pop("entropy_decoding", None)
+        # Whether to record per-layer argmax token ids and the final selected token ids.
+        self.entropy_record_tokens = kwargs.pop("entropy_record_tokens", None)
+        # Whether to record per-layer entropies and per-layer logits at every generation step.
+        # WARNING: per-layer logits are O(B * L * V) per step — for typical V=128k, L=32, this is
+        # ~16 MB per step in float32. Across 1000 tokens this is 16 GB. By default we offload
+        # logits to CPU and store top-k only; see `entropy_logits_top_k` and
+        # `entropy_offload_to_cpu` below.
+        self.entropy_record_per_layer_metrics = kwargs.pop("entropy_record_per_layer_metrics", None)
+        # Whether to also record per-layer hidden states (last position only) at every step.
+        # Required for the latent-geometric analyses (cosine similarity, L2 distance between
+        # the entropy-valley layer's hidden state and the last layer's hidden state).
+        self.entropy_record_per_layer_hidden_states = kwargs.pop(
+            "entropy_record_per_layer_hidden_states", None
+        )
+        # If set to a positive int, only the top-k logits/probabilities of each layer are
+        # recorded (along with their token ids) instead of the full vocab-size logits tensor.
+        # This dramatically reduces memory / IO. Set to None to record full logits.
+        self.entropy_logits_top_k = kwargs.pop("entropy_logits_top_k", None)
+        # If True (default), all recorded entropy observation tensors are moved to CPU
+        # immediately after computation (non-blocking) to keep GPU memory bounded.
+        self.entropy_offload_to_cpu = kwargs.pop("entropy_offload_to_cpu", None)
+
         # Common attributes
         self._commit_hash = kwargs.pop("_commit_hash", None)
         self._from_model_config = kwargs.pop("_from_model_config", None)
@@ -544,6 +578,26 @@ class GenerationConfig(PushToHubMixin):
                     "You've set `dola_layers`, which triggers DoLa generate. Currently, DoLa generate "
                     "is only supported with Greedy Search and Sample.  However, the base decoding mode (based on "
                     f"current flags) is {generation_mode} -- some of the set flags will be ignored."
+                )
+
+        # Entropy-based inner-layer decoding overrides greedy/sample modes.
+        # Both active decoding (`entropy_decoding` is not None) and observation-only mode
+        # (any `entropy_record_*` flag is set) route through `_entropy_decoding`.
+        has_entropy_flag = (
+            self.entropy_decoding is not None
+            or self.entropy_record_tokens is not None
+            or self.entropy_record_per_layer_metrics is not None
+            or self.entropy_record_per_layer_hidden_states is not None
+        )
+        if has_entropy_flag:
+            if generation_mode in (GenerationMode.GREEDY_SEARCH, GenerationMode.SAMPLE):
+                generation_mode = GenerationMode.ENTROPY_DECODING
+            else:
+                logger.warning(
+                    "You've set an entropy-related flag (`entropy_decoding` or `entropy_record_*`), which "
+                    "captures per-layer statistics at each step. Currently, entropy decoding is only "
+                    f"supported with Greedy Search and Sample. However, the base decoding mode is "
+                    f"{generation_mode} -- the entropy flags will be ignored."
                 )
         return generation_mode
 
