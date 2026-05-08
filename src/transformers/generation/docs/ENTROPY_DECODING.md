@@ -93,7 +93,7 @@ outputs = model.generate(
 
 ## Output Structure
 
-When `return_dict_in_generate=True,`, the output is a `GenerateDecoderOnlyOutput` object with:
+When `return_dict_in_generate=True`, the output is a `GenerateDecoderOnlyOutput` object with:
 
 | Field | Type | Shape | Description |
 |-------|------|-------|-------------|
@@ -121,3 +121,26 @@ When `return_dict_in_generate=True,`, the output is a `GenerateDecoderOnlyOutput
 - **Default behavior**: `entropy_logits_top_k=None` records full vocabulary logits (`[B, L, V]`). This can be **very large** (e.g., ~1.6GB for B=1, L=40, V=32000 per step).
 - **Recommended**: Set `entropy_logits_top_k=50` to truncate to top-50 tokens (~200KB/step).
 - **CPU offload**: `entropy_offload_to_cpu=True` (default when any record flag is set) moves tensors to CPU via non-blocking transfer, freeing GPU memory quickly.
+
+## Supported Models
+
+Entropy valley decoding requires per-layer hidden states to be normalized with the **final LayerNorm/RMSNorm** before computing logits, ensuring a fair comparison across layers. The following models have this mechanism implemented:
+
+- **Qwen3.5** (`Qwen3_5ForCausalLM`, `Qwen3_5ForConditionalGeneration`)
+- **Qwen3.5 MoE** (`Qwen3_5MoeForCausalLM`, `Qwen3_5MoeForConditionalGeneration`)
+- **GPT-OSS** (`GptOssForCausalLM`)
+- **Gemma4** (`Gemma4ForCausalLM`, `Gemma4ForConditionalGeneration`)
+- **DeepSeekV3** (`DeepseekV3ForCausalLM`)
+
+For other models, the algorithm falls back to using pre-norm hidden states (which may produce suboptimal layer selection). Adding support for additional models requires adding a `get_final_norm()` method to the model's `ForCausalLM` / `ForConditionalGeneration` class that returns the final norm module.
+
+## How It Works
+
+At each generation step:
+
+1. **Extract per-layer hidden states** from the model output (`outputs.hidden_states[1:]`, skipping the embedding output).
+2. **Apply final normalization** to each layer's hidden state using the model's final RMSNorm/LayerNorm.
+3. **Compute logits** via `lm_head(normalized_hidden)` for each layer.
+4. **Calculate entropy** from the softmax distribution of each layer's logits.
+5. **Select the entropy valley** — the first layer (from the back) where entropy stops decreasing.
+6. **Decode** from the selected layer's logits (or last layer in observation-only mode).

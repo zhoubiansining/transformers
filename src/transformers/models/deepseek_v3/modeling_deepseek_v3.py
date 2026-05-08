@@ -646,6 +646,10 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
         # Initialize weights and apply final processing
         self.post_init()
 
+    def get_final_norm(self) -> torch.nn.Module:
+        """Return the final LayerNorm/RMSNorm module for entropy-based decoding."""
+        return self.model.norm
+
     @can_return_tuple
     @auto_docstring
     def forward(

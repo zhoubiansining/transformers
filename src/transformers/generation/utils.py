@@ -2953,6 +2953,8 @@ class GenerationMixin(ContinuousMixin):
                 "Entropy-based inner-layer decoding requires a CausalLM model with an `lm_head` "
                 "or a `get_output_embeddings()` module."
             )
+        # Get final norm for consistent per-layer normalization before lm_head
+        final_norm = getattr(self, "get_final_norm", lambda: None)()
 
         entropy_strategy = generation_config.entropy_decoding
         record_tokens = generation_config.entropy_record_tokens
@@ -3075,10 +3077,13 @@ class GenerationMixin(ContinuousMixin):
                 hs[:, -1, :] for hs in all_layer_hidden_states[1:]
             ]  # L * [B, H]
 
-            # Compute raw logits for each layer
-            logits_per_layer: list[torch.Tensor] = [
-                lm_head(hs) for hs in per_layer_step_hiddens
-            ]  # L * [B, V]
+            # Normalize each layer's hidden state with the final norm for fair comparison,
+            # then compute raw logits for each layer
+            logits_per_layer: list[torch.Tensor] = []
+            for hs in per_layer_step_hiddens:
+                if final_norm is not None:
+                    hs = final_norm(hs)
+                logits_per_layer.append(lm_head(hs))  # L * [B, V]
             L = len(logits_per_layer)
             device = input_ids.device
 

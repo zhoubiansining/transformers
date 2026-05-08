@@ -1701,6 +1701,10 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
         # Initialize weights and apply final processing
         self.post_init()
 
+    def get_final_norm(self) -> torch.nn.Module:
+        """Return the final LayerNorm/RMSNorm module for entropy-based decoding."""
+        return self.model.norm
+
     @can_return_tuple
     @auto_docstring
     def forward(
@@ -1816,6 +1820,10 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
 
     def set_input_embeddings(self, value):
         self.model.set_input_embeddings(value)
+
+    def get_final_norm(self) -> torch.nn.Module:
+        """Return the final LayerNorm/RMSNorm module for entropy-based decoding."""
+        return self.model.language_model.norm
 
     @auto_docstring
     def get_video_features(
